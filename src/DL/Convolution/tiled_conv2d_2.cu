@@ -39,14 +39,16 @@ __global__ void sharedmem_conv2d_kernel(
     const int IN_TILE_Width_pxls = Kw + stride * (TILE_Width_convTime - 1); 
     extern __shared__ float input_tile[];
     
+    // 각 타일당 공유메모리로 불러들어야할 총 입력픽셀 수를 계산
     // 블록 내부의 모든 스레드가 입력픽셀들의 로딩에 참여(각자의 컨볼루션을 수행하기 이전에)
     // 블록 내부의 평탄화된 인덱스들로 블록안의 스레드들 각각이 한번에 하나씩 픽셀들을 로딩함
-    const int pixeloadersPerBlock = TILE_Width_convTime * TILE_Height_convTime;
-    const int tid = threadIdx.y * TILE_Width_convTime + threadIdx.x;
+    const int IN_TILE_total_pxls = IN_TILE_Height_pxls * IN_TILE_Width_pxls;
+    const int loaderNumsPerBlock = TILE_Height_convTime * TILE_Width_convTime;
+    const int loaders = threadIdx.y * TILE_Width_convTime + threadIdx.x;
 
     // 출력타일들의 좌상단 병렬 좌표
-    const int tile_output_x = blockIdx.x * TILE_Width_convTime; 
-    const int tile_output_y = blockIdx.y * TILE_Height_convTime; 
+    const int tiles_output_top = blockIdx.y * TILE_Height_convTime;
+    const int tiles_output_left = blockIdx.x * TILE_Width_convTime; 
     
     // 배치 인덱스
     const int n = blockIdx.z;
@@ -54,31 +56,32 @@ __global__ void sharedmem_conv2d_kernel(
     // 모든 출력 채널 루프에서 출력 타일들의 좌상단 병렬 좌표에서
     // 병렬 오프셋을 더해서 각 스레드가 담당하는 출력 픽셀의 위치를 잡음
     for (int kout = 0; kout < Kout; ++kout) {
-        const int out_x = tile_output_x + threadIdx.x;
-        const int out_y = tile_output_y + threadIdx.y;
+        const int out_y = tiles_output_top + threadIdx.y;
+        const int out_x = tiles_output_left + threadIdx.x;
 
         float output_sum = 0.0f;
-
-        // (5) 모든 입력 채널에 대해 누산
+        
+        // 입력 채널
         for (int cin = 0; cin < C; ++cin) {
-
-            // (5-1) 공유메모리에 입력타일을 모두 로딩
-            const int input_tile_elems = IN_TILE_Height_pxls * IN_TILE_Width_pxls;
-            
-            for (int idx = tid; idx < input_tile_elems; idx += pixeloadersPerBlock) {
+            for (int tidx1d = loaders; tidx1d < IN_TILE_total_pxls; tidx1d += loaderNumsPerBlock) {
                 
-                const int tile_i = idx / IN_TILE_Width_pxls;
-                const int tile_j = idx % IN_TILE_Width_pxls;
-
-                // 입력 feature map 상의 전역 좌표를 출력타일들의 좌상단 좌표로 복원
-                // 
-                const int in_y = tile_output_y * stride + tile_i - pad;
-                const int in_x = tile_output_x * stride + tile_j - pad;
-
+                // 전역메모리를 참조하기위해 평탄화된 인덱스로부터 
+                // 공유메모리를 참조하기위한 2차원 행,열 인덱스를 복원
+                const int tile_is = tidx1d / IN_TILE_Width_pxls;
+                const int tile_js = tidx1d % IN_TILE_Width_pxls;
+                
+                // 리셉티브필드(버퍼)안의 블록안의스레드수만큼 픽셀(탭)들을 한번에 로딩
+                const int tabIdxs_y = tiles_output_top * stride + tile_is - pad;
+                const int tabIdxs_x = tiles_output_left * stride + tile_js - pad;
                 float val = 0.0f;
-                if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W)
-                    val = input[n*C*H*W + cin*H*W + in_y*W + in_x];
-                input_tile[tile_i * IN_TILE_Width_pxls + tile_j] = val;
+                
+                // 전역메모리를 참조
+                if (tabIdxs_y >= 0 && tabIdx_y < H && tabIdxs_x >= 0 && tabIdxs_x < W)
+                    val = input[n*C*H*W + cin*H*W + tabIdxs_y*W + tabIdxs_x];
+                
+                // 공유메모리로 로딩
+                input_tile[tile_is * IN_TILE_Width_pxls + tile_js] = val;
+                
             }
             __syncthreads(); // 공유메모리 타일 완성 대기
 
