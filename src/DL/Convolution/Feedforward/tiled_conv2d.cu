@@ -89,13 +89,13 @@ __global__ void sharedmem_conv2d_kernel(
                 float receptiveFld = 0.0f;
                 
                 // 전역메모리에서 공유메모리로 로딩할 때 "정확하게 필요한 수 만큼"의 스레드들만 참여해서 계산리소스 절약
-                // 
+                // 전역메모리에서 공유메모리로 로딩 때는 매 오프셋(스레드이동을 위한)마다 경계조건을 검사
                 // 매번 스레드블록이 탭(픽셀)들을 로딩할 때마다 전역메모리상의 인덱스들에 대해서 경계조건이 검사되어야함
                 if (loadIng_tabIdxs_y >= 0 && loadIng_tabIdxs_y < H && loadIng_tabJdxs_x >= 0 && loadIng_tabJdxs_x < W)
                     receptiveFld = input[n*C*H*W + cin*H*W + loadIng_tabIdxs_y*W + loadIng_tabJdxs_x]; 
                 
                 // 마스크와 맞물리는 공유메모리영역으로 로딩(recoordinated_loaded_idx/jdx를 이용해서 참조)
-                // 공유메모리안의 recoordinated_loaded_idx/jdx는 마스크와 맞물리는 버퍼안의탭들의인덱스 tabIdxs_x/y
+                // 공유메모리안의 recoordinated_loaded_idx/jdx는 전역메모리의 버퍼안의탭들의인덱스 tabIdxs_x/y
                 // 출력단에서 인접픽셀들이 전역메모리단에서처럼 공유메모리단에서도 스트라이드차이가 남
                 // 단지 스트라이드가 마스크의 폭보다 작으면 인풋피쳐맵에서 경계에 있는 패딩의 픽셀들이 누락되는것이고
                 // 스트라이드가 마스크의 폭보다 크면 인풋피쳐맵에서 이웃 리셉티브필드 사이에 있는 픽셀들이 누락되는것임
@@ -107,25 +107,26 @@ __global__ void sharedmem_conv2d_kernel(
 
             // <<2. 출력피쳐맵의 경계조건>>
             // "정확하게 필요한 수 만큼"의  스레드들만 참여해서 계산리소스를 절약해야하기 때문에 병렬계산 전에 "인덱스들"의 경계조건을 따지는것이 중요함
-            // 출력픽셀의 수만큼의 스레드들이 계산(컨볼루션)에 참여해야하고 결과인 출력피쳐맵을 전역메모리에 기록해야하기 때문에
-            // 전역인덱스들의 경계조건을 따져야하며, 전역인덱스들은 출력피쳐맵의 폭이나 높이를 초과하면 안됨
+            // 각 입력채널당 마스크를 출력채널의 횟수만큼 적용(컨볼루션)하고 합치는 형태이기 때문에 
+            // 각 출력채널에 대한 컨볼루션 결과를 받을 부분합을 먼저 선언
             if (tiles_output_left_gIdx + threadIdx.x < Wo && tiles_output_top_gIdx + threadIdx.y < Ho) {
                 float partial_sum = 0.0f;
                 
-                // 마스크의 모든 픽셀에 대해서 순회(방향오프셋으로 순회)
+                // 하나의 스레드가 하나의 출력픽셀을 계산하기로 되어있으므로, 
+                // 각 스레드는 마스크의 모든 픽셀에 대해서 순회(방향오프셋으로 순회)
                 for (int ki = 0; ki < Kh; ++ki) {
                     for (int kj = 0; kj < Kw; ++kj) {
                         
                         // 출력피쳐맵의 타일안에서 인접픽셀들을 계산하는 threadIdx 끼리 
-                        // 전역메모리의 입력단에서 리셉티브필드가 스트라이드 차이가 나는것처럼
-                        // 그들의 공유메모리에서 리셉티브필드차이도 여전히 스트라이드만큼 차이가 남
-                        // (기준점오프셋)+(방향오프셋)
-                        const int tile_i = threadIdx.y * stride + ki;
-                        const int tile_j = threadIdx.x * stride + kj;
+                        // 전역메모리에서 가져와야할 리셉티브필드간 거리차가 스트라이드 차이가 나는것처럼
+                        // 그들의 공유메모리에서 리셉티브필드간 거리차이도 여전히 스트라이드만큼 차이가 남
+                        // 스트라이드만큼 차이나는 공유메모리안 시작점에서 스레드들이 어떻게 이동할지 정의
+                        const int tidxMov_y_inTile = threadIdx.y * stride + ki;
+                        const int tidxMov_x_inTile = threadIdx.x * stride + kj;
                         
-                        // 공유메모리shared_mem에서 해당 리셉티브필드 위치 값을 읽음
-                        // weight[-][-][ki][kj] * shared_mem[threadIdx.y*stride+ki][threadIdx.x*stride+kj]
-                        float receptiveFld_eles = shared_mem[tile_i * numSharedMEM_Width_pxls + tile_j];
+                        // 공유메모리shared_mem에서 해당 리셉티브필드 위치 값을 읽음, 병렬스레드가 참조
+                        float receptiveFld_eles = shared_mem[tidxMov_y_inTile * numSharedMEM_Width_pxls + tidxMov_x_inTile];
+                        // 병렬스레드들에 대해서 고정된 단일 스레드가 참조
                         float mask_eles = weight[kout*C*Kh*Kw + cin*Kh*Kw + ki*Kw + kj];
                         
                         partial_sum += receptiveFld_eles * mask_eles;
@@ -138,66 +139,13 @@ __global__ void sharedmem_conv2d_kernel(
             
         } // 입력채널순회종료
 
-        // 특정출력채널kout에서 편향 더하고 결과를 전역 출력에 기록
+        // 출력피쳐맵의 결과를 적어놓는곳은 전역메모리이므로 전역스레드에 대해서 경계조건 따지고, 전역스레드로 출력피쳐맵을 참조해서 결과를 기록
         if (tiles_output_left_gIdx + threadIdx.x < Wo && tiles_output_top_gIdx + threadIdx.y < Ho) {
-            output_sum += bias[kout];
-            output[n*Kout*Ho*Wo + kout*Ho*Wo + (tiles_output_top_gIdx + threadIdx.y)*Wo + \ 
-            (tiles_output_left_gIdx + threadIdx.y)] = output_sum;
+            output_sum += bias[kout]; // 출력채널별로 임계값(=-편향)을 따짐
+            output[n*Kout*Ho*Wo + kout*Ho*Wo + (tiles_output_top_gIdx + threadIdx.y)*Wo + (tiles_output_left_gIdx + threadIdx.y)] = output_sum;
         } 
         __syncthreads(); // 다음 출력채널 전환 전 동기화
         
     } // 출력채널순회종료
     
 } //커널종료
-
-int main() {
-    /* -------------------- 1. 파라미터 -------------------- */
-    constexpr int N = 1, C = 1, H = 3, W = 3;
-    constexpr int Kout = 1, Kh = 2, Kw = 2;
-    constexpr int pad = 0, stride = 1;
-    constexpr int Ho  = (H - Kh) / stride + 1;
-    constexpr int Wo  = (W - Kw) / stride + 1;
-
-    /* -------------------- 2. 호스트 버퍼 ------------------- */
-    float h_in [H * W]   = { 1,2,3,4,5,6,7,8,9 };
-    float h_w  [Kh * Kw] = { 1,0,0,1 };
-    float h_b  [Kout]    = { 0 };
-    float h_out[Ho * Wo] = { 0 };
-
-    /* -------------------- 3. 디바이스 메모리 ---------------- */
-    float *d_in, *d_w, *d_b, *d_out;
-    cudaMalloc(&d_in , sizeof(h_in ));
-    cudaMalloc(&d_w  , sizeof(h_w  ));
-    cudaMalloc(&d_b  , sizeof(h_b  ));
-    cudaMalloc(&d_out, sizeof(h_out));
-
-    cudaMemcpy(d_in, h_in, sizeof(h_in), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w , h_w , sizeof(h_w ), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b , h_b , sizeof(h_b ), cudaMemcpyHostToDevice);
-
-    /* -------------------- 4. 커널 실행 --------------------- */
-    dim3 block(Wo, Ho);      // 2×2 = 4 threads
-    dim3 grid (1, 1, N);     // 배치 N개 → blockIdx.z
-
-    size_t smem = (Kh + stride*(block.y-1)) *
-                  (Kw + stride*(block.x-1)) * sizeof(float);
-
-    sharedmem_conv2d_kernel<<<grid, block, smem>>>(
-        d_in, d_w, d_b, d_out,
-        N, C, H, W, Kout, Kh, Kw, pad, stride);
-    cudaDeviceSynchronize();
-
-    /* -------------------- 5. 결과 확인 -------------------- */
-    cudaMemcpy(h_out, d_out, sizeof(h_out), cudaMemcpyDeviceToHost);
-
-    printf("Output (%d×%d):\n", Ho, Wo);
-    for (int i = 0; i < Ho; ++i) {
-        for (int j = 0; j < Wo; ++j)
-            printf("%6.1f ", h_out[i*Wo + j]);
-        printf("\n");
-    }
-
-    /* -------------------- 6. 자원 반환 -------------------- */
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_b); cudaFree(d_out);
-    return 0;
-}
