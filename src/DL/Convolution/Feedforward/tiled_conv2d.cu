@@ -124,7 +124,8 @@ __global__ void sharedmem_conv2d_kernel(
                         const int tidxMov_y_inTile = threadIdx.y * stride + ki;
                         const int tidxMov_x_inTile = threadIdx.x * stride + kj;
                         
-                        // 공유메모리shared_mem에서 해당 리셉티브필드 위치 값을 읽음, 병렬스레드가 참조
+                        // 공유메모리shared_mem에서 해당 리셉티브필드 위치 값을 읽음
+                        // 
                         float receptiveFld_eles = shared_mem[tidxMov_y_inTile * numSharedMEM_Width_pxls + tidxMov_x_inTile];
                         // 병렬스레드들에 대해서 고정된 단일 스레드가 참조
                         float mask_eles = weight[kout*C*Kh*Kw + cin*Kh*Kw + ki*Kw + kj];
